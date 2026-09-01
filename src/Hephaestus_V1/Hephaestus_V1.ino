@@ -255,10 +255,11 @@ void setup()
   Serial.println("System check complete. Logging started.");
   // Log format (pipe-delimited): TIME(logstep) | TEMP(F) | ALT(ft) | BARO(hPa) |
   // PITCH/ROLL/YAW(deg) | ACCX/Y/Z(g, unit vector, tilt-relative not physical) |
+  // GX/GY/GZ(g, true magnitude, vertical-axis-remapped raw accel) |
   // GYRX/Y/Z(deg/s) | AIRSPD(ft/s, vertical velocity estimate)
   // Event lines are emitted out-of-band as ">>> EVENT: <name> at t=<logstep>" and
   // do not match this column format -- a parser should special-case the ">>>" prefix.
-  Serial.println("  TIME  | TEMP |  ALT | BARO | PITCH | ROLL  | YAW  |  ACCX  |  ACCY  |  ACCZ  |  GYRX  |  GYRY  |  GYRZ | AIRSPD");
+  Serial.println("  TIME  | TEMP |  ALT | BARO | PITCH | ROLL  | YAW  |  ACCX  |  ACCY  |  ACCZ  |  GX  |  GY  |  GZ  |  GYRX  |  GYRY  |  GYRZ | AIRSPD");
 
 }
 
@@ -475,7 +476,7 @@ void loop()
 
 //------------------------------------------- FORMAT LOG -------------------------------------------------
 
-  formatpacket(logstep,temp,altitude,P_now,accel,gyro,airspeed);
+  formatpacket(logstep,temp,altitude,P_now,accel,gyro,airspeed,accelRawMapped);
   delay(50);
 
 
@@ -494,7 +495,7 @@ void loop()
 
 }
 
-void formatpacket(int16_t time, float temp, float alt, float baro, Vector3 accel, Vector3 gyro, float airspeed)
+void formatpacket(int16_t time, float temp, float alt, float baro, Vector3 accel, Vector3 gyro, float airspeed, Vector3 gRaw)
 {
 
 //------------------------------------------- COMPLEMENT FILTER ------------------------------------------------- 
@@ -528,6 +529,13 @@ void formatpacket(int16_t time, float temp, float alt, float baro, Vector3 accel
   Serial.print(accel.y , 4);
   Serial.print(" | ");
   Serial.print(accel.z , 4);
+  Serial.print(" | ");
+//------------------------------------------- RAW G LOAD X Y Z LOG -------------------------------------------------
+  Serial.print(gRaw.x , 4);
+  Serial.print(" | ");
+  Serial.print(gRaw.y , 4);
+  Serial.print(" | ");
+  Serial.print(gRaw.z , 4);
   Serial.print(" | ");
 //------------------------------------------- GYRO X Y Z LOG -------------------------------------------------
   Serial.print(gyro.x , 4);
