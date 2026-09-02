@@ -1,9 +1,32 @@
 #include <Wire.h>
+#include <SD.h>
 #include <Adafruit_BMP280.h>
 #include "MPU6050_6Axis_MotionApps20.h"
 
 #define CHIP_ID_REG 0xD0
 #define G 9.80665
+
+// Mirrors every log line to both Serial (live bench monitoring) and the
+// Teensy 4.1's onboard SD card (the actual flight record -- there's no
+// live link once it's in the air). Overriding just write(uint8_t) is
+// enough for all of Print's print()/println() overloads to work through
+// this, so replacing "Serial." with "logOutput." at every existing call
+// site is all it takes -- no other changes needed.
+class LogTee : public Print {
+  public:
+    File file;
+    bool fileOpen = false;
+
+    size_t write(uint8_t c) override {
+      size_t n = Serial.write(c);
+      if (fileOpen) file.write(c);
+      return n;
+    }
+};
+
+LogTee logOutput;
+char logFilename[16];
+const unsigned long SD_FLUSH_INTERVAL_MS = 1000; // bound data loss on abrupt power-off without flushing every line
 
 // !!! SAFETY: NEVER leave this defined for a real flight. When defined, the
 // vertical-axis accel and barometric pressure are replaced with a scripted
@@ -101,15 +124,50 @@ Adafruit_BMP280 bmp(&Wire2);
 //Found device at 0x76
 
 
-void setup() 
+// No RTC on this board, so file names can't use a timestamp -- pick the
+// first unused LOGnnn.TXT instead, so each flight gets its own file rather
+// than overwriting the last one.
+void chooseLogFilename()
+{
+  for (int i = 0; i < 1000; i++)
+  {
+    snprintf(logFilename, sizeof(logFilename), "LOG%03d.TXT", i);
+    if (!SD.exists(logFilename)) return;
+  }
+  strcpy(logFilename, "LOG999.TXT"); // all 1000 taken, reuse the last one rather than fail
+}
+
+void setup()
 {
 //------------------------------------------- SERIAL AND PIN INIT ----------------------------------------------
  //SERIAL & I2C
   Serial.begin(9600);
 
+//------------------------------------------- INITIALIZE SD -------------------------------------------------
+// SD logging is optional: if the card is missing or fails to open, we fall
+// back to Serial-only rather than halting the flight computer over it.
+  if (SD.begin(BUILTIN_SDCARD))
+  {
+    chooseLogFilename();
+    logOutput.file = SD.open(logFilename, FILE_WRITE);
+    logOutput.fileOpen = (bool)logOutput.file;
+    if (logOutput.fileOpen)
+    {
+      logOutput.print("SD logging to "); logOutput.println(logFilename);
+    }
+    else
+    {
+      logOutput.println("SD card present but failed to open log file -- Serial-only logging.");
+    }
+  }
+  else
+  {
+    logOutput.println("No SD card found -- Serial-only logging.");
+  }
+
 #ifdef SIMULATE_FLIGHT
   for (int i = 0; i < 5; i++) {
-    Serial.println("!!! SIMULATION MODE -- FAKE SENSOR DATA -- DO NOT FLY !!!");
+    logOutput.println("!!! SIMULATION MODE -- FAKE SENSOR DATA -- DO NOT FLY !!!");
   }
 #endif
 
@@ -121,11 +179,11 @@ void setup()
   pinMode(ledrxtx, OUTPUT);
   pinMode(ledon, OUTPUT);
   pinMode(goled, OUTPUT);
-  Serial.println("Initializing Pins");
+  logOutput.println("Initializing Pins");
 
 //------------------------------------------- PREFLIGHT SETTLE ----------------------------------------------
 
-  Serial.println("Settling sensors...");
+  logOutput.println("Settling sensors...");
   delay(PREFLIGHT_SETTLE_MS);
 
 //------------------------------------------- SENSOR INIT ---------------------------------------------------
@@ -133,15 +191,15 @@ void setup()
 //------------------------------------------- INITALIZE BMP -------------------------------------------------
 
   unsigned status;
-  Serial.println("Initializing BMP");
+  logOutput.println("Initializing BMP");
   status = bmp.begin(0x76);
 
   if (!status) 
   {
-    Serial.println(F("Could not find a valid BMP280 sensor, check wiring or try a different address!"));
-    Serial.print("SensorID was: 0x"); Serial.println(bmp.sensorID(),16);
+    logOutput.println(F("Could not find a valid BMP280 sensor, check wiring or try a different address!"));
+    logOutput.print("SensorID was: 0x"); logOutput.println(bmp.sensorID(),16);
   }
-  Serial.print("BMP ID was: 0x"); Serial.println(bmp.sensorID(),16);
+  logOutput.print("BMP ID was: 0x"); logOutput.println(bmp.sensorID(),16);
   bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,     /* Operating Mode. */
                   Adafruit_BMP280::SAMPLING_X2,     /* Temp. oversampling */
                   Adafruit_BMP280::SAMPLING_X16,    /* Pressure oversampling */
@@ -149,7 +207,7 @@ void setup()
                   Adafruit_BMP280::STANDBY_MS_500); /* Standby time. */
 
   P_launch = bmp.readPressure() / 100.0F; // convert Pa to hPa
-  Serial.print("Launch pressure: "); Serial.println(P_launch);                
+  logOutput.print("Launch pressure: "); logOutput.println(P_launch);                
 
   digitalWrite(goled,HIGH);
   delay(60);
@@ -162,7 +220,7 @@ void setup()
 
 //------------------------------------------- INITALIZE MPU1 -------------------------------------------------
 
-  Serial.println("Initializing MPU1");
+  logOutput.println("Initializing MPU1");
   mpu1.initialize();
   mpu1.setFullScaleGyroRange(MPU6050_GYRO_FS_1000);
   mpu1.setFullScaleAccelRange(3); // +/-16g (AFS_SEL=3); must match the /2048.0 sensitivity used to convert raw counts to g's below
@@ -171,7 +229,7 @@ void setup()
 
   mpu1.CalibrateAccel(10);  // Calibration Time: generate offsets and calibrate our MPU6050
   mpu1.CalibrateGyro(10);
-  Serial.println("These are the Active offsets: ");
+  logOutput.println("These are the Active offsets: ");
   mpu1.PrintActiveOffsets();//Get expected DMP packet size for later comparison
 
   digitalWrite(goled,HIGH);
@@ -185,7 +243,7 @@ void setup()
 
 //------------------------------------------- INITALIZE MPU2 -------------------------------------------------
 
-  Serial.println("Initializing MPU2");
+  logOutput.println("Initializing MPU2");
   mpu2.initialize();
   mpu2.setFullScaleGyroRange(MPU6050_GYRO_FS_1000);
   mpu2.setFullScaleAccelRange(3); // +/-16g (AFS_SEL=3); must match the /2048.0 sensitivity used to convert raw counts to g's below
@@ -194,7 +252,7 @@ void setup()
 
   mpu2.CalibrateAccel(10);  // Calibration Time: generate offsets and calibrate our MPU6050
   mpu2.CalibrateGyro(10);
-  Serial.println("These are the Active offsets: \n");
+  logOutput.println("These are the Active offsets: \n");
   mpu2.PrintActiveOffsets();
 
   digitalWrite(goled,HIGH);
@@ -214,36 +272,36 @@ void setup()
   Wire2.requestFrom(0x76, 1);
   if (Wire2.available()) {
     byte id = Wire2.read();
-    Serial.print("Chip ID: 0x");
-    Serial.println(id, HEX);
+    logOutput.print("Chip ID: 0x");
+    logOutput.println(id, HEX);
 
     if (id == 0x58) {
-      Serial.println("BMP280 Online");
+      logOutput.println("BMP280 Online");
     } else {
-      Serial.println("Unexpected chip.");
+      logOutput.println("Unexpected chip.");
     }
   } else {
-    Serial.println("No response from BMP280.");
+    logOutput.println("No response from BMP280.");
   }
 
 //------------------------------------------- MPU TEST -------------------------------------------------
 //MPU1
   if (!mpu1.testConnection()) 
   {
-    Serial.println("MPU1 Connection Failed");
+    logOutput.println("MPU1 Connection Failed");
   }
   else
   {
-    Serial.println("MPU1 Online");
+    logOutput.println("MPU1 Online");
   }
 //MPU2
   if (!mpu2.testConnection()) 
   {
-    Serial.println("MPU2 Connection Failed");
+    logOutput.println("MPU2 Connection Failed");
   }
   else
   {
-    Serial.println("MPU2 Online");
+    logOutput.println("MPU2 Online");
   }
 
   
@@ -252,14 +310,14 @@ void setup()
   digitalWrite(goled,LOW);
   delay(1200);
   digitalWrite(goled,HIGH);
-  Serial.println("System check complete. Logging started.");
+  logOutput.println("System check complete. Logging started.");
   // Log format (pipe-delimited): TIME(logstep) | TEMP(F) | ALT(ft) | BARO(hPa) |
   // PITCH/ROLL/YAW(deg) | ACCX/Y/Z(g, unit vector, tilt-relative not physical) |
   // GX/GY/GZ(g, true magnitude, vertical-axis-remapped raw accel) |
   // GYRX/Y/Z(deg/s) | AIRSPD(ft/s, vertical velocity estimate)
   // Event lines are emitted out-of-band as ">>> EVENT: <name> at t=<logstep>" and
   // do not match this column format -- a parser should special-case the ">>>" prefix.
-  Serial.println("  TIME  | TEMP |  ALT | BARO | PITCH | ROLL  | YAW  |  ACCX  |  ACCY  |  ACCZ  |  GX  |  GY  |  GZ  |  GYRX  |  GYRY  |  GYRZ | AIRSPD");
+  logOutput.println("  TIME  | TEMP |  ALT | BARO | PITCH | ROLL  | YAW  |  ACCX  |  ACCY  |  ACCZ  |  GX  |  GY  |  GZ  |  GYRX  |  GYRY  |  GYRZ | AIRSPD");
 
 }
 
@@ -415,7 +473,7 @@ void loop()
         {
           flightState = BOOST;
           debounceCount = 0;
-          Serial.print(">>> EVENT: LIFTOFF at t="); Serial.println(logstep);
+          logOutput.print(">>> EVENT: LIFTOFF at t="); logOutput.println(logstep);
         }
       }
       else debounceCount = 0;
@@ -428,7 +486,7 @@ void loop()
         {
           flightState = COAST;
           debounceCount = 0;
-          Serial.print(">>> EVENT: BURNOUT at t="); Serial.println(logstep);
+          logOutput.print(">>> EVENT: BURNOUT at t="); logOutput.println(logstep);
         }
       }
       else debounceCount = 0;
@@ -441,7 +499,7 @@ void loop()
       if (!apogeeLogged && velocity < 0)
       {
         apogeeLogged = true;
-        Serial.print(">>> EVENT: APOGEE at t="); Serial.println(logstep);
+        logOutput.print(">>> EVENT: APOGEE at t="); logOutput.println(logstep);
       }
 
       // Chute deploy (inferred): sharp deceleration spike while descending, one-shot.
@@ -451,7 +509,7 @@ void loop()
         if (decel > CHUTE_DECEL)
         {
           chuteLogged = true;
-          Serial.print(">>> EVENT: CHUTE DEPLOY (inferred) at t="); Serial.println(logstep);
+          logOutput.print(">>> EVENT: CHUTE DEPLOY (inferred) at t="); logOutput.println(logstep);
         }
       }
 
@@ -462,7 +520,8 @@ void loop()
         else if (millis() - landedSince >= LANDED_HOLD_MS)
         {
           flightState = LANDED_STATE;
-          Serial.print(">>> EVENT: LANDED at t="); Serial.println(logstep);
+          logOutput.print(">>> EVENT: LANDED at t="); logOutput.println(logstep);
+          if (logOutput.fileOpen) logOutput.file.flush(); // flight's over -- get this safely on disk now, don't wait for the next periodic flush
         }
       }
       else landedSince = 0;
@@ -479,6 +538,17 @@ void loop()
   formatpacket(logstep,temp,altitude,P_now,accel,gyro,airspeed,accelRawMapped);
   delay(50);
 
+//------------------------------------------- SD PERIODIC FLUSH -------------------------------------------------
+// Writes are buffered; flush() forces the actual physical write. Flushing
+// every line adds real per-loop latency for no benefit -- flushing too
+// rarely risks losing the most valuable tail of data (landing/impact) if
+// power cuts abruptly. ~1s bounds that loss without slowing every loop.
+  static unsigned long lastSdFlush = 0;
+  if (logOutput.fileOpen && millis() - lastSdFlush >= SD_FLUSH_INTERVAL_MS)
+  {
+    logOutput.file.flush();
+    lastSdFlush = millis();
+  }
 
   if (logstep>20)
   {
@@ -508,43 +578,43 @@ void formatpacket(int16_t time, float temp, float alt, float baro, Vector3 accel
 
 
 //------------------------------------------- BUFFER LOGGING (TIME TEMP ALT BARO) -------------------------------------------------
-  Serial.print(time);
-  Serial.print(" | ");
-  Serial.print(temp, 1);
-  Serial.print(" | ");
-  Serial.print(alt, 1);
-  Serial.print(" | ");
-  Serial.print(baro, 1);
-  Serial.print(" | ");
+  logOutput.print(time);
+  logOutput.print(" | ");
+  logOutput.print(temp, 1);
+  logOutput.print(" | ");
+  logOutput.print(alt, 1);
+  logOutput.print(" | ");
+  logOutput.print(baro, 1);
+  logOutput.print(" | ");
 //------------------------------------------- PITCH ROLL LOG -------------------------------------------------
-  Serial.print(pitch , 3);
-  Serial.print(" | ");
-  Serial.print(roll , 3);
-  Serial.print(" | ");
-  Serial.print(yaw , 3);
-  Serial.print(" | ");
+  logOutput.print(pitch , 3);
+  logOutput.print(" | ");
+  logOutput.print(roll , 3);
+  logOutput.print(" | ");
+  logOutput.print(yaw , 3);
+  logOutput.print(" | ");
 //------------------------------------------- ACCEL X Y Z LOG -------------------------------------------------
-  Serial.print(accel.x , 4);
-  Serial.print(" | ");
-  Serial.print(accel.y , 4);
-  Serial.print(" | ");
-  Serial.print(accel.z , 4);
-  Serial.print(" | ");
+  logOutput.print(accel.x , 4);
+  logOutput.print(" | ");
+  logOutput.print(accel.y , 4);
+  logOutput.print(" | ");
+  logOutput.print(accel.z , 4);
+  logOutput.print(" | ");
 //------------------------------------------- RAW G LOAD X Y Z LOG -------------------------------------------------
-  Serial.print(gRaw.x , 4);
-  Serial.print(" | ");
-  Serial.print(gRaw.y , 4);
-  Serial.print(" | ");
-  Serial.print(gRaw.z , 4);
-  Serial.print(" | ");
+  logOutput.print(gRaw.x , 4);
+  logOutput.print(" | ");
+  logOutput.print(gRaw.y , 4);
+  logOutput.print(" | ");
+  logOutput.print(gRaw.z , 4);
+  logOutput.print(" | ");
 //------------------------------------------- GYRO X Y Z LOG -------------------------------------------------
-  Serial.print(gyro.x , 4);
-  Serial.print(" | ");
-  Serial.print(gyro.y , 4);
-  Serial.print(" | ");
-  Serial.print(gyro.z , 4);
-  Serial.print(" | ");
+  logOutput.print(gyro.x , 4);
+  logOutput.print(" | ");
+  logOutput.print(gyro.y , 4);
+  logOutput.print(" | ");
+  logOutput.print(gyro.z , 4);
+  logOutput.print(" | ");
 //------------------------------------------- AIRSPEED LOG -------------------------------------------------
-  Serial.println(airspeed , 2);
+  logOutput.println(airspeed , 2);
 }
 
