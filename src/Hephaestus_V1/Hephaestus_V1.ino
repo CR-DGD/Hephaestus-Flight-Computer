@@ -143,28 +143,6 @@ void setup()
  //SERIAL & I2C
   Serial.begin(9600);
 
-//------------------------------------------- INITIALIZE SD -------------------------------------------------
-// SD logging is optional: if the card is missing or fails to open, we fall
-// back to Serial-only rather than halting the flight computer over it.
-  if (SD.begin(BUILTIN_SDCARD))
-  {
-    chooseLogFilename();
-    logOutput.file = SD.open(logFilename, FILE_WRITE);
-    logOutput.fileOpen = (bool)logOutput.file;
-    if (logOutput.fileOpen)
-    {
-      logOutput.print("SD logging to "); logOutput.println(logFilename);
-    }
-    else
-    {
-      logOutput.println("SD card present but failed to open log file -- Serial-only logging.");
-    }
-  }
-  else
-  {
-    logOutput.println("No SD card found -- Serial-only logging.");
-  }
-
 #ifdef SIMULATE_FLIGHT
   for (int i = 0; i < 5; i++) {
     logOutput.println("!!! SIMULATION MODE -- FAKE SENSOR DATA -- DO NOT FLY !!!");
@@ -185,6 +163,54 @@ void setup()
 
   logOutput.println("Settling sensors...");
   delay(PREFLIGHT_SETTLE_MS);
+
+//------------------------------------------- INITIALIZE SD -------------------------------------------------
+// SD logging is optional: if the card is missing or fails to open, we fall
+// back to Serial-only rather than halting the flight computer over it.
+  if (SD.begin(BUILTIN_SDCARD))
+  {
+    chooseLogFilename();
+    logOutput.file = SD.open(logFilename, FILE_WRITE);
+    logOutput.fileOpen = (bool)logOutput.file;
+    if (logOutput.fileOpen)
+    {
+      logOutput.print("SD logging to "); logOutput.println(logFilename);
+      digitalWrite(ledrxtx,HIGH);
+      delay(120);
+      digitalWrite(ledrxtx,LOW);
+      delay(120);
+      digitalWrite(ledrxtx,HIGH);
+      delay(120);
+      digitalWrite(ledrxtx,LOW);
+      delay(120);
+      digitalWrite(ledrxtx,HIGH);
+      delay(120);
+      digitalWrite(ledrxtx,LOW);
+    }
+    else
+    {
+      logOutput.println("SD card present but failed to open log file -- Serial-only logging.");
+    }
+  }
+  else
+  {
+    logOutput.println("No SD card found -- Serial-only logging.");
+    digitalWrite(ledrxtx,HIGH);
+    delay(600);
+    digitalWrite(ledrxtx,LOW);
+    delay(600);
+    digitalWrite(ledrxtx,HIGH);
+    delay(600);
+    digitalWrite(ledrxtx,LOW);
+  }
+
+  digitalWrite(ledrxtx,HIGH);
+  delay(60);
+  digitalWrite(ledrxtx,LOW);
+  delay(60);
+  digitalWrite(ledrxtx,HIGH);
+  delay(60);
+  digitalWrite(ledrxtx,LOW);
 
 //------------------------------------------- SENSOR INIT ---------------------------------------------------
 
@@ -548,10 +574,8 @@ void loop()
   {
     logOutput.file.flush();
     lastSdFlush = millis();
-  }
-
-  if (logstep>20)
-  {
+    digitalWrite(ledrxtx,LOW);
+    delay(30);
     digitalWrite(ledrxtx,HIGH);
   }
 
