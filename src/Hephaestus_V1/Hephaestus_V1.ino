@@ -27,6 +27,8 @@ class LogTee : public Print {
 LogTee logOutput;
 char logFilename[16];
 const unsigned long SD_FLUSH_INTERVAL_MS = 1000; // bound data loss on abrupt power-off without flushing every line
+unsigned long lastSdFlush = 0;
+bool sdLedBlinking = false;
 
 // !!! SAFETY: NEVER leave this defined for a real flight. When defined, the
 // vertical-axis accel and barometric pressure are replaced with a scripted
@@ -61,9 +63,12 @@ const int goled = 9;
 // off of them -- capturing those too early biases everything downstream.
 const unsigned long PREFLIGHT_SETTLE_MS = 3000;
 
-//Log time value
-int logstep = 0;
+// Schedule sample starts, including sensor/logging work in the 60 Hz budget.
+const unsigned long SAMPLE_INTERVAL_US = 16667;
+const float FILTER_REFERENCE_DT = 0.05f; // preserve the filters' original nominal 20 Hz response
+uint32_t logstep = 0;
 unsigned long prevTime = 0;
+unsigned long loggingStartedMs = 0;
 float dt;
 
 //output values
@@ -92,12 +97,13 @@ const float BURNOUT_G        = 0.5;  // g's on vertical axis to call burnout (ne
 const float CHUTE_DECEL      = 4.0;  // m/s^2 deceleration spike (while descending) to infer chute deploy
 const float LANDED_SPEED     = 1.0;  // m/s, |velocity| below this counts as "stopped"
 const float LANDED_ALT_M     = 3.0;  // meters from pad altitude counts as "on the ground"
-const int DEBOUNCE_SAMPLES   = 3;    // consecutive samples required before liftoff/burnout latches
+const unsigned long DEBOUNCE_HOLD_US = 100000; // first-to-third sample span at the original nominal 20 Hz
 const unsigned long LANDED_HOLD_MS = 1000; // must stay stopped this long to call it landed
 
 enum FlightState { PAD, BOOST, COAST, LANDED_STATE };
 FlightState flightState = PAD;
-int debounceCount = 0;
+unsigned long debounceSince = 0;
+bool debounceActive = false;
 bool apogeeLogged = false;
 bool chuteLogged = false;
 float prevVelocityForChute = 0;
@@ -140,7 +146,7 @@ void chooseLogFilename()
 void setup()
 {
 //------------------------------------------- SERIAL AND PIN INIT ----------------------------------------------
- //SERIAL & I2C
+ //SERIAL & I2Ci
   Serial.begin(9600);
 
 #ifdef SIMULATE_FLIGHT
@@ -226,11 +232,13 @@ void setup()
     logOutput.print("SensorID was: 0x"); logOutput.println(bmp.sensorID(),16);
   }
   logOutput.print("BMP ID was: 0x"); logOutput.println(bmp.sensorID(),16);
+  // ~83 Hz typical output; STANDBY_MS_1 is Adafruit's name for 0.5 ms.
   bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,     /* Operating Mode. */
-                  Adafruit_BMP280::SAMPLING_X2,     /* Temp. oversampling */
-                  Adafruit_BMP280::SAMPLING_X16,    /* Pressure oversampling */
+                  Adafruit_BMP280::SAMPLING_X1,     /* Temp. oversampling */
+                  Adafruit_BMP280::SAMPLING_X4,     /* Pressure oversampling */
                   Adafruit_BMP280::FILTER_X16,      /* Filtering. */
-                  Adafruit_BMP280::STANDBY_MS_500); /* Standby time. */
+                  Adafruit_BMP280::STANDBY_MS_1);   /* Standby time. */
+  delay(20); // allow a fresh conversion before capturing the pad pressure
 
   P_launch = bmp.readPressure() / 100.0F; // convert Pa to hPa
   logOutput.print("Launch pressure: "); logOutput.println(P_launch);                
@@ -344,19 +352,21 @@ void setup()
   // Event lines are emitted out-of-band as ">>> EVENT: <name> at t=<logstep>" and
   // do not match this column format -- a parser should special-case the ">>>" prefix.
   logOutput.println("  TIME  | TEMP |  ALT | BARO | PITCH | ROLL  | YAW  |  ACCX  |  ACCY  |  ACCZ  |  GX  |  GY  |  GZ  |  GYRX  |  GYRY  |  GYRZ | AIRSPD");
-
+  loggingStartedMs = millis();
+  lastSdFlush = loggingStartedMs;
+  prevTime = micros();
 }
 
 #ifdef SIMULATE_FLIGHT
 //------------------------------------------- BENCH SIMULATION PROFILE --------------------------------------
-// Scripted fake flight, indexed by logstep (~20 samples/sec). Phases are
+// Scripted fake flight, indexed by elapsed time in nominal 20 Hz steps. Phases are
 // deliberately long/generous rather than physically exact -- this only
 // needs to reliably walk the real event state machine through every
 // transition on the bench, not model true flight dynamics.
 
 const float SIM_TEMP_C = 20.0; // constant, event logic never reads temp
 
-float simVerticalG(int step) {
+float simVerticalG(float step) {
   if (step < 21)  return 1.00;                                    // PAD
   if (step < 41)  return 1.00 + (step - 20) * (5.00 - 1.00) / 20.0; // BOOST ramp 1g->5g
   if (step < 131) return 0.10;                                    // COAST/freefall
@@ -365,7 +375,7 @@ float simVerticalG(int step) {
   return 1.00;                                                    // LANDED tail
 }
 
-float simAltitude_m(int step) {
+float simAltitude_m(float step) {
   if (step < 21)  return 0.0;
   if (step < 41)  return (step - 20) * 80.0 / 20.0;                        // 0 -> 80m
   if (step < 101) return 80.0 + (step - 40) * (300.0 - 80.0) / 60.0;       // 80 -> 300m (apogee ~100)
@@ -403,17 +413,22 @@ Vector3 remap(Vector3 raw)
 
 void loop()
 {
-  logstep++;
-
-  if (prevTime == 0) 
+  if (sdLedBlinking && millis() - lastSdFlush >= 30)
   {
-  prevTime = micros();
-  return;
+    digitalWrite(ledrxtx,HIGH);
+    sdLedBlinking = false;
   }
 
   unsigned long currentTime = micros();
-  dt = (currentTime - prevTime) / 1000000.0;
+  unsigned long elapsedUs = currentTime - prevTime; // unsigned subtraction handles micros() rollover
+  if (elapsedUs < SAMPLE_INTERVAL_US) return;
+
+  // After a slow SD write, take one sample using actual dt; don't burst to catch up.
   prevTime = currentTime;
+  dt = elapsedUs / 1000000.0f;
+  logstep++;
+  // A missed observation cannot establish a continuous liftoff/burnout streak.
+  if (elapsedUs > 2 * SAMPLE_INTERVAL_US) debounceActive = false;
 
 //------------------------------------------- MPU LOG -------------------------------------------------
 
@@ -421,8 +436,9 @@ void loop()
   int16_t ax2, ay2, az2, gx2, gy2, gz2; //MPU2
 
 #ifdef SIMULATE_FLIGHT
+  const float simStep = (millis() - loggingStartedMs) / 50.0f;
   // Z is this board's confirmed vertical mounting axis (matches real logs).
-  int16_t simRawG = (int16_t)(simVerticalG(logstep) * 2048.0);
+  int16_t simRawG = (int16_t)(simVerticalG(simStep) * 2048.0);
   ax1 = 0; ay1 = 0; az1 = simRawG; gx1 = 0; gy1 = 0; gz1 = 0;
   ax2 = 0; ay2 = 0; az2 = simRawG; gx2 = 0; gy2 = 0; gz2 = 0;
 #else
@@ -457,7 +473,7 @@ void loop()
 //------------------------------------------- BMP LOG -------------------------------------------------
 
 #ifdef SIMULATE_FLIGHT
-  float P_now = P_launch * exp(-simAltitude_m(logstep) / 8434.0); // hPa, inverts the altitude formula below
+  float P_now = P_launch * exp(-simAltitude_m(simStep) / 8434.0); // hPa, inverts the altitude formula below
   float temp = SIM_TEMP_C;
 #else
   float P_now = bmp.readPressure() / 100.0F;// current pressure in hPa
@@ -465,9 +481,7 @@ void loop()
 #endif
   float altitude_m = 8434.0 * log(P_launch / P_now); // meters
 
-  // dt is 0.0 on the very first sample (no delay() has run yet at that point),
-  // and X/0.0 is +/-Inf in float math -- guard it, since one Inf sample here
-  // permanently poisons the complementary filter below (0.98*Inf is still Inf).
+  // Keep invalid dt from poisoning the velocity filter with infinity.
   float baroVelocity = (dt > 0.0) ? (altitude_m - prevAltitude_m) / dt : 0.0; // m/s
   prevAltitude_m = altitude_m;
 
@@ -476,7 +490,8 @@ void loop()
 
 //------------------------------------------- AIRSPEED (complementary filter) -----------------------------------
 
-  velocity = 0.98 * (velocity + accelVelocity) + 0.02 * baroVelocity; // m/s
+  float velocityAlpha = powf(0.98f, dt / FILTER_REFERENCE_DT);
+  velocity = velocityAlpha * (velocity + accelVelocity) + (1.0f - velocityAlpha) * baroVelocity; // m/s
   // Hold at zero while stationary on the pad: accelRawMapped.x is never
   // exactly 1.000g at rest (real accelerometer calibration always has some
   // residual offset), and that constant tiny bias integrates into apparent
@@ -495,27 +510,29 @@ void loop()
     case PAD:
       if (g_vertical > LIFTOFF_G)
       {
-        if (++debounceCount >= DEBOUNCE_SAMPLES)
+        if (!debounceActive) { debounceSince = currentTime; debounceActive = true; }
+        if (currentTime - debounceSince >= DEBOUNCE_HOLD_US)
         {
           flightState = BOOST;
-          debounceCount = 0;
+          debounceActive = false;
           logOutput.print(">>> EVENT: LIFTOFF at t="); logOutput.println(logstep);
         }
       }
-      else debounceCount = 0;
+      else debounceActive = false;
       break;
 
     case BOOST:
       if (g_vertical < BURNOUT_G)
       {
-        if (++debounceCount >= DEBOUNCE_SAMPLES)
+        if (!debounceActive) { debounceSince = currentTime; debounceActive = true; }
+        if (currentTime - debounceSince >= DEBOUNCE_HOLD_US)
         {
           flightState = COAST;
-          debounceCount = 0;
+          debounceActive = false;
           logOutput.print(">>> EVENT: BURNOUT at t="); logOutput.println(logstep);
         }
       }
-      else debounceCount = 0;
+      else debounceActive = false;
       break;
 
     case COAST:
@@ -562,42 +579,38 @@ void loop()
 //------------------------------------------- FORMAT LOG -------------------------------------------------
 
   formatpacket(logstep,temp,altitude,P_now,accel,gyro,airspeed,accelRawMapped);
-  delay(50);
 
 //------------------------------------------- SD PERIODIC FLUSH -------------------------------------------------
-// Writes are buffered; flush() forces the actual physical write. Flushing
-// every line adds real per-loop latency for no benefit -- flushing too
-// rarely risks losing the most valuable tail of data (landing/impact) if
-// power cuts abruptly. ~1s bounds that loss without slowing every loop.
-  static unsigned long lastSdFlush = 0;
+// Flush once a second to limit unsaved data. SD writes/flushes can still
+// overrun a sample period; the scheduler uses actual dt when that happens.
   if (logOutput.fileOpen && millis() - lastSdFlush >= SD_FLUSH_INTERVAL_MS)
   {
     logOutput.file.flush();
     lastSdFlush = millis();
     digitalWrite(ledrxtx,LOW);
-    delay(30);
-    digitalWrite(ledrxtx,HIGH);
+    sdLedBlinking = true;
   }
 
-  if (logstep>150)
+  static unsigned long lastBeepMs = 0;
+  unsigned long loggingElapsedMs = millis() - loggingStartedMs;
+  if (loggingElapsedMs >= 10000 && loggingElapsedMs - lastBeepMs >= 2500)
   {
-    if (logstep%50 == 0)
-    {
-      tone(buzzer,500,500);
-    }
+    tone(buzzer,500,500);
+    lastBeepMs = loggingElapsedMs;
   }
 
 }
 
-void formatpacket(int16_t time, float temp, float alt, float baro, Vector3 accel, Vector3 gyro, float airspeed, Vector3 gRaw)
+void formatpacket(uint32_t time, float temp, float alt, float baro, Vector3 accel, Vector3 gyro, float airspeed, Vector3 gRaw)
 {
 
 //------------------------------------------- COMPLEMENT FILTER ------------------------------------------------- 
   float pitchAcc = atan2(accel.y, accel.z)* RAD_TO_DEG;
   float rollAcc  = atan2(-accel.x, accel.z) * RAD_TO_DEG;
 
-  pitch = 0.998 * (pitch + gyro.x * dt) + 0.002 * pitchAcc;
-  roll  = 0.998 * (roll  + gyro.y * dt) + 0.002 * rollAcc;
+  float attitudeAlpha = powf(0.998f, dt / FILTER_REFERENCE_DT);
+  pitch = attitudeAlpha * (pitch + gyro.x * dt) + (1.0f - attitudeAlpha) * pitchAcc;
+  roll  = attitudeAlpha * (roll  + gyro.y * dt) + (1.0f - attitudeAlpha) * rollAcc;
   yaw   = yaw + gyro.z * dt; 
 
 

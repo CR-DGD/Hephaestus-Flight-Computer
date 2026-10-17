@@ -34,6 +34,19 @@ Hephaestus is a custom-built flight computer designed to collect and process fli
 ## Example Output
 <img width="1513" height="234" alt="image" src="https://github.com/user-attachments/assets/afbe94a2-c4d7-4770-84f9-34c6dc938cd3" />
 
+## Sampling and verification
+
+- The firmware targets 60 Hz (16,667 microseconds between sample starts), including sensor reads and logging within that interval. Slow SD writes/flushes can still cause missed periods; integration uses the measured elapsed time and the loop does not burst to catch up.
+- The BMP280 uses temperature x1, pressure x4, and 0.5 ms standby (~83 Hz typical conversions). This reduces oversampling relative to the old x16 setting; its x16 IIR filter remains enabled, so conversion rate is not the same as response bandwidth.
+- Filter weights, flight-event debounce, the bench simulation, and the buzzer use elapsed time. Filter/debounce timing retains the original nominal 20 Hz tuning.
+- `TIME` and event `t=` remain sample counters, not seconds. USB serial baud settings do not control Teensy's USB transfer speed.
+- On the bench, check for roughly 600 samples over 10 seconds after startup, both with and without the SD card. Inspect occasional long intervals separately; host serial timestamps can include USB buffering. The real board's sustained rate and flight-event tuning still require hardware validation.
+- Keep `SIMULATE_FLIGHT` commented out for real sensor operation. The simulation substitutes fake sensor data.
+
+Compile with the installed Arduino/Teensy toolchain: `arduino-cli compile --fqbn teensy:avr:teensy41 src/Hephaestus_V1`.
+
+Run the software timing checks on Windows with Python and the Visual Studio C++ tools installed: `python tests/firmware/test_timing.py`. They compile the actual sketch against a fake clock and hardware interfaces, including simulation, rollover, overruns, debounce, filter response, and counter formatting. They do not measure hardware latency.
+
 
 ## Tech Stack
 - C++ (Arduino framework)
