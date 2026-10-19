@@ -66,6 +66,9 @@ const unsigned long PREFLIGHT_SETTLE_MS = 3000;
 // Schedule sample starts, including sensor/logging work in the 60 Hz budget.
 const unsigned long SAMPLE_INTERVAL_US = 16667;
 const float FILTER_REFERENCE_DT = 0.05f; // preserve the filters' original nominal 20 Hz response
+// Trust accel for attitude only when it reads ~1g (gravity alone). Under
+// thrust or in coast it reads thrust/drag, so the filter runs gyro-only.
+const float ACCEL_TRUST_G = 0.1f;
 uint32_t logstep = 0;
 unsigned long prevTime = 0;
 unsigned long loggingStartedMs = 0;
@@ -79,7 +82,8 @@ float pitchAcc;
 float rollAcc;
 float yawAcc;
 float P_launch = 0;
-float velocity = 0;       // fused vertical speed estimate, m/s
+float zBias1 = 0, zBias2 = 0; // g's left on Z after CalibrateAccel, measured at rest in setup
+float velocity = 0;      // fused vertical speed estimate, m/s
 float prevAltitude_m = 0; // previous BMP altitude, meters (for baro velocity)
 
 //vec3 struct
@@ -289,6 +293,28 @@ void setup()
   logOutput.println("These are the Active offsets: \n");
   mpu2.PrintActiveOffsets();
 
+#ifndef SIMULATE_FLIGHT
+  // CalibrateAccel's PID removes gravity as (32768 >> range) counts, which is
+  // 2g at any range, so Z sits near 2g at rest (logs read ~1.92g). Measure what
+  // Z actually reads at rest and subtract the excess. Needs Z up at boot, same
+  // as CalibrateAccel itself.
+  {
+    const int n = 200;
+    float sum1 = 0, sum2 = 0;
+    int16_t ax, ay, az, gx, gy, gz;
+    for (int i = 0; i < n; i++)
+    {
+      mpu1.getMotion6(&ax, &ay, &az, &gx, &gy, &gz); sum1 += az / 2048.0;
+      mpu2.getMotion6(&ax, &ay, &az, &gx, &gy, &gz); sum2 += az / 2048.0;
+      delay(2);
+    }
+    zBias1 = sum1 / n - 1.0;
+    zBias2 = sum2 / n - 1.0;
+    logOutput.print("Accel Z bias (g): "); logOutput.print(zBias1, 3);
+    logOutput.print(" / "); logOutput.println(zBias2, 3);
+  }
+#endif
+
   digitalWrite(goled,HIGH);
   delay(60);
   digitalWrite(goled,LOW);
@@ -447,8 +473,8 @@ void loop()
   mpu2.getMotion6(&ax2, &ay2, &az2, &gx2, &gy2, &gz2);
 #endif
 
-  Vector3 a1 = { ax1/2048.0, ay1/2048.0, az1/2048.0 };
-  Vector3 a2 = { ax2/2048.0, ay2/2048.0, az2/2048.0 };
+  Vector3 a1 = { ax1/2048.0, ay1/2048.0, az1/2048.0 - zBias1 };
+  Vector3 a2 = { ax2/2048.0, ay2/2048.0, az2/2048.0 - zBias2 };
   Vector3 g1 = { gx1/32.8, gy1/32.8, gz1/32.8 };
   Vector3 g2 = { gx2/32.8, gy2/32.8, gz2/32.8 };
 
@@ -610,7 +636,9 @@ void formatpacket(uint32_t time, float temp, float alt, float baro, Vector3 acce
   float pitchAcc = atan2(accel.y, accel.z)* RAD_TO_DEG;
   float rollAcc  = atan2(-accel.x, accel.z) * RAD_TO_DEG;
 
-  float attitudeAlpha = powf(0.998f, dt / FILTER_REFERENCE_DT);
+  // gRaw is a remapped copy of the raw accel, so its length is the true magnitude.
+  float gMag = sqrt(gRaw.x*gRaw.x + gRaw.y*gRaw.y + gRaw.z*gRaw.z);
+  float attitudeAlpha = (fabsf(gMag - 1.0f) < ACCEL_TRUST_G) ? powf(0.998f, dt / FILTER_REFERENCE_DT) : 1.0f;
   pitch = attitudeAlpha * (pitch + gyro.x * dt) + (1.0f - attitudeAlpha) * pitchAcc;
   roll  = attitudeAlpha * (roll  + gyro.y * dt) + (1.0f - attitudeAlpha) * rollAcc;
   yaw   = yaw + gyro.z * dt; 
