@@ -346,7 +346,7 @@ void setup()
   digitalWrite(goled,HIGH);
   logOutput.println("System check complete. Logging started.");
   // Log format (pipe-delimited): TIME(logstep) | TEMP(F) | ALT(ft) | BARO(hPa) |
-  // PITCH/ROLL/YAW(deg) | ACCX/Y/Z(g, unit vector, tilt-relative not physical) |
+  // PITCH/ROLL/YAW(deg) | ACCX/Y/Z(g, unit vector, sensor frame) |
   // GX/GY/GZ(g, true magnitude, vertical-axis-remapped raw accel) |
   // GYRX/Y/Z(deg/s) | AIRSPD(ft/s, vertical velocity estimate)
   // Event lines are emitted out-of-band as ">>> EVENT: <name> at t=<logstep>" and
@@ -461,7 +461,9 @@ void loop()
 
   Vector3 gyro =  { (g1.x+g2.x)/2, (g1.y+g2.y)/2, (g1.z+g2.z)/2 };
 
-  accel = remap(accel);
+  // accel stays in the sensor frame: the attitude filter blends it with gyro,
+  // which is never remapped, so both must share axes. Remapping here turned
+  // pitchAcc into atan2(~0, ~0) at rest in every orientation.
 
   // ponytail: remap() picks "vertical" by largest-magnitude axis with no
   // guaranteed up/down sign convention -- fine for an approximately-straight-up
